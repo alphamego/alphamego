@@ -10205,70 +10205,99 @@ function Chaos:Window(cfg)
     --------------------------------------------------------------
     -- dragging
     --
-    -- Obsidian's IsClickInput() requires Library.IsRobloxFocused, which is
-    -- only set back to true by UserInputService.WindowFocused. Plenty of
-    -- executors never fire that event after injecting, so the flag stays
-    -- false: buttons keep working (they use MouseButton1Click, which does
-    -- not check it) but the window can no longer be dragged. If input is
-    -- reaching the game at all, the game is focused.
+    -- The fork binds the main window's drag to the tiny WindowIcon only, and
+    -- gates it on Library.Toggled + IsRobloxFocused. IsRobloxFocused only
+    -- flips true again on UserInputService.WindowFocused, which many executors
+    -- never fire after injecting - so the window becomes unmovable while
+    -- buttons (MouseButton1Click, which skips the flag) still work.
+    --
+    -- Rather than fight those flags, drive dragging directly off the full
+    -- 48px top bar. This is self-contained and immune to the executor quirks.
     --------------------------------------------------------------
-    Library.IsRobloxFocused = true
-    ChaosUIS.InputBegan:Connect(function() Library.IsRobloxFocused = true end)
-    ChaosUIS.InputChanged:Connect(function() Library.IsRobloxFocused = true end)
-
-    -- The sidebar grabber sets CantDragForced on press and clears it from the
-    -- input's End event. A missed End leaves the window undraggable forever.
-    ChaosUIS.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
-            Library.CantDragForced = false
+    local mainFrame = Library.ScreenGui:FindFirstChild("Main")
+    local topBar
+    if mainFrame then
+        for _, child in ipairs(mainFrame:GetChildren()) do
+            if child:IsA("Frame") and child.Size == UDim2.new(1, 0, 0, 48) then
+                topBar = child
+                break
+            end
         end
-    end)
+    end
+
+    if mainFrame and topBar then
+        local dragging, startPos, frameStart = false, nil, nil
+        topBar.Active = true
+
+        topBar.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+                dragging   = true
+                startPos   = input.Position
+                frameStart = mainFrame.Position
+            end
+        end)
+
+        ChaosUIS.InputEnded:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+                dragging = false
+                Library.CantDragForced = false   -- unstick the sidebar grabber
+            end
+        end)
+
+        ChaosUIS.InputChanged:Connect(function(input)
+            if not dragging then return end
+            if input.UserInputType ~= Enum.UserInputType.MouseMovement
+            and input.UserInputType ~= Enum.UserInputType.Touch then return end
+            local delta = input.Position - startPos
+            mainFrame.Position = UDim2.new(
+                frameStart.X.Scale, frameStart.X.Offset + delta.X,
+                frameStart.Y.Scale, frameStart.Y.Offset + delta.Y
+            )
+        end)
+    end
 
     --------------------------------------------------------------
-    -- rounded corners
+    -- rounded corners  (one-time pass)
     --
     -- This fork hard-zeroes every UICorner inside New(), and its
-    -- SetCornerRadius ignores its argument (it assigns Radius = 0 on the
-    -- first line), so the radius has to be re-applied to the instances.
-    -- DescendantAdded covers popups and notifications built later.
+    -- SetCornerRadius ignores its argument (Radius = 0 on the first line), so
+    -- the radius has to be re-applied to the instances. The listener detaches
+    -- itself a few seconds after load - by then every element exists, and the
+    -- executor's own drawn UI shouldn't keep paying for a global hook.
     --------------------------------------------------------------
     local function roundCorner(inst)
         if not inst:IsA("UICorner") then return end
         task.defer(function()
-            if not inst.Parent then return end
-            local size = inst.Parent:IsA("GuiObject") and inst.Parent.AbsoluteSize or nil
-            local radius = 6
-            if size then
-                local smallest = math.min(size.X, size.Y)
-                if smallest < 8 then return end          -- slivers look wrong rounded
-                radius = math.clamp(math.floor(smallest / 3), 3, 6)
-            end
-            inst.CornerRadius = UDim.new(0, radius)
+            if not inst.Parent or not inst.Parent:IsA("GuiObject") then return end
+            local smallest = math.min(inst.Parent.AbsoluteSize.X, inst.Parent.AbsoluteSize.Y)
+            if smallest < 8 then return end               -- slivers look wrong rounded
+            inst.CornerRadius = UDim.new(0, math.clamp(math.floor(smallest / 3), 3, 6))
         end)
     end
 
     for _, descendant in ipairs(Library.ScreenGui:GetDescendants()) do
         roundCorner(descendant)
     end
-    Library.ScreenGui.DescendantAdded:Connect(roundCorner)
-
-    --------------------------------------------------------------
-    -- watermark
-    --------------------------------------------------------------
-    local frames, elapsed, fps = 0, 0, 60
-    ChaosRun.RenderStepped:Connect(function(dt)
-        frames += 1
-        elapsed += dt
-        if elapsed >= 0.5 then
-            fps = math.floor(frames / elapsed)
-            frames, elapsed = 0, 0
-        end
+    local cornerConn = Library.ScreenGui.DescendantAdded:Connect(roundCorner)
+    task.delay(5, function()
+        if cornerConn.Connected then cornerConn:Disconnect() end
     end)
 
+    --------------------------------------------------------------
+    -- watermark  (single 1 Hz loop; no per-frame or per-input work)
+    --
+    -- FPS is sampled from RenderStepped's own dt over the wait window instead
+    -- of a running per-frame counter, so there is exactly one connection.
+    --------------------------------------------------------------
+    Library.IsRobloxFocused = true
     pcall(function() Library:SetWatermarkVisibility(true) end)
     task.spawn(function()
         while not Library.Unloaded do
+            Library.IsRobloxFocused = true   -- keep secondary draggables alive, no race
+            local dt = ChaosRun.RenderStepped:Wait()
+            local fps = dt > 0 and math.floor(1 / dt + 0.5) or 60
             local ping = 0
             pcall(function()
                 ping = math.floor(ChaosStats.Network.ServerStatsItem["Data Ping"]:GetValue())
