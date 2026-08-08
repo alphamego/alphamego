@@ -9969,6 +9969,11 @@ return Library
 
 end)()
 
+local ChaosUIS    = game:GetService("UserInputService")
+local ChaosRun    = game:GetService("RunService")
+local ChaosStats  = game:GetService("Stats")
+local ChaosPlayer = game:GetService("Players").LocalPlayer
+
 --==================================================================
 --  CHAOS  -  fire-themed shim over Obsidian
 --
@@ -10196,6 +10201,87 @@ function Chaos:Window(cfg)
         Font          = Enum.Font.GothamMedium,
         ToggleKeybind = Enum.KeyCode.RightControl,
     })
+
+    --------------------------------------------------------------
+    -- dragging
+    --
+    -- Obsidian's IsClickInput() requires Library.IsRobloxFocused, which is
+    -- only set back to true by UserInputService.WindowFocused. Plenty of
+    -- executors never fire that event after injecting, so the flag stays
+    -- false: buttons keep working (they use MouseButton1Click, which does
+    -- not check it) but the window can no longer be dragged. If input is
+    -- reaching the game at all, the game is focused.
+    --------------------------------------------------------------
+    Library.IsRobloxFocused = true
+    ChaosUIS.InputBegan:Connect(function() Library.IsRobloxFocused = true end)
+    ChaosUIS.InputChanged:Connect(function() Library.IsRobloxFocused = true end)
+
+    -- The sidebar grabber sets CantDragForced on press and clears it from the
+    -- input's End event. A missed End leaves the window undraggable forever.
+    ChaosUIS.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            Library.CantDragForced = false
+        end
+    end)
+
+    --------------------------------------------------------------
+    -- rounded corners
+    --
+    -- This fork hard-zeroes every UICorner inside New(), and its
+    -- SetCornerRadius ignores its argument (it assigns Radius = 0 on the
+    -- first line), so the radius has to be re-applied to the instances.
+    -- DescendantAdded covers popups and notifications built later.
+    --------------------------------------------------------------
+    local function roundCorner(inst)
+        if not inst:IsA("UICorner") then return end
+        task.defer(function()
+            if not inst.Parent then return end
+            local size = inst.Parent:IsA("GuiObject") and inst.Parent.AbsoluteSize or nil
+            local radius = 6
+            if size then
+                local smallest = math.min(size.X, size.Y)
+                if smallest < 8 then return end          -- slivers look wrong rounded
+                radius = math.clamp(math.floor(smallest / 3), 3, 6)
+            end
+            inst.CornerRadius = UDim.new(0, radius)
+        end)
+    end
+
+    for _, descendant in ipairs(Library.ScreenGui:GetDescendants()) do
+        roundCorner(descendant)
+    end
+    Library.ScreenGui.DescendantAdded:Connect(roundCorner)
+
+    --------------------------------------------------------------
+    -- watermark
+    --------------------------------------------------------------
+    local frames, elapsed, fps = 0, 0, 60
+    ChaosRun.RenderStepped:Connect(function(dt)
+        frames += 1
+        elapsed += dt
+        if elapsed >= 0.5 then
+            fps = math.floor(frames / elapsed)
+            frames, elapsed = 0, 0
+        end
+    end)
+
+    pcall(function() Library:SetWatermarkVisibility(true) end)
+    task.spawn(function()
+        while not Library.Unloaded do
+            local ping = 0
+            pcall(function()
+                ping = math.floor(ChaosStats.Network.ServerStatsItem["Data Ping"]:GetValue())
+            end)
+            pcall(function()
+                Library:SetWatermark(string.format(
+                    "chaos  |  %s  |  %d fps  |  %d ms",
+                    ChaosPlayer.DisplayName, fps, ping
+                ))
+            end)
+            task.wait(1)
+        end
+    end)
 
     local self = setmetatable({ Window = win, Tabs = {} }, WindowProto)
     Chaos._window = self
